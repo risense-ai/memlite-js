@@ -1,6 +1,6 @@
 {
   "name": "@rsrsai/memlite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Embeddable local memory engine (TypeScript). Data-compatible with respire-memlite (Rust).",
   "type": "module",
   "main": "./dist/index.cjs",
