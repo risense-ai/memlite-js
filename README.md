@@ -17,8 +17,10 @@
 
 - [方案](./docs/proposal.md)——定位、技术选型、模块划分
 - [计划](./docs/plan.md)——里程碑与任务拆解
+- [进度](./docs/plan-progress.md)——逐项打勾的实施记录
 - [互通契约](./docs/compat.md)——与 Rust memlite 的数据契约
 - [嵌入档详设](./docs/embedding.md)——三档 provider 与密钥管理
+- [变更记录](./CHANGELOG.md)
 
 ## 快速开始
 
@@ -26,6 +28,12 @@
 pnpm install
 pnpm -C packages/core build
 pnpm -C packages/core test
+```
+
+互通测试（可选，需 Rust 二进制）：
+
+```bash
+MEMLITE_RS_BIN=/path/to/memlite pnpm -C packages/core test
 ```
 
 ## 协议
