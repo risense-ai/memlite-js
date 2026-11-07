@@ -75,13 +75,14 @@ jobs:
       - run: pnpm -r build
       - run: pnpm -r test
 
-      - name: Publish @rsrsai/memlite
-        if: ${{ secrets.NPM_TOKEN != '' }}
+      - name: Publish @rsrsai/memlite（有 NPM_TOKEN 才发，否则跳过说明）
         working-directory: packages/core
-        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish skipped (no NPM_TOKEN)
-        if: ${{ secrets.NPM_TOKEN == '' }}
-        run: echo "未配置 NPM_TOKEN，跳过 npm 发布（本地发布或后续配 token 后重推 tag）"
+          HAS_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" = "true" ]; then
+            npm publish --access public
+          else
+            echo "未配置 NPM_TOKEN，跳过 npm 发布（本地发布或后续配 token 后重推 tag）"
+          fi
