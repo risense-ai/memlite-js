@@ -231,13 +231,45 @@ export class Store {
   }
 
   /** 就地改：同 id 追加新 put（末写胜出，id 不变）。
-   * extra 全量保留（parent_id/importance/kind 随迁——改前文不能丢因链）。 */
-  putWithId(rid: string, content: string, title: string, tags: string[], project: string): void {
+   * extra 全量保留（parent_id/importance/kind 随迁——改前文不能丢因链）；
+   * extraPatch 非空时按键合并覆盖（parent_id 仍以库中原值为准，改挂走 reparent）。 */
+  putWithId(rid: string, content: string, title: string, tags: string[], project: string, extraPatch?: Record<string, unknown>): void {
     if (content.trim() === '') throw new Error('content 为空')
-    const extra = this.records.get(rid)?.extra ?? {}
+    const old = this.records.get(rid)
+    const extra: Record<string, unknown> = { ...old?.extra, ...extraPatch }
+    extra['parent_id'] = old ? parentId(old) : ''
     const rec = makePut(rid, nowTs(), content.trim(), title.trim(), cleanTags(tags), project.trim(), extra)
     this.append(rec)
     this.apply(rec)
+  }
+
+  /** 完整受控存入：显式 id/ts/extra（导入桥等客户端用）；parent 非空须已在库。
+   * id 已在库即拒（改条走 update 流）；extra 中夹带的 parent_id 以 parent 参数为准。 */
+  putFull(p: {
+    id?: string
+    ts?: number
+    content: string
+    title: string
+    tags?: string[]
+    project?: string
+    parent?: string
+    extra?: Record<string, unknown>
+  }): string {
+    if (p.content.trim() === '') throw new Error('content 为空')
+    if (p.id !== undefined && this.records.has(p.id)) {
+      throw new Error(`id 已存在（改条走 update 流）: ${p.id}`)
+    }
+    const parent = p.parent ?? ''
+    if (parent !== '' && !this.records.has(parent)) {
+      throw new Error(`目标因（父）不存在: ${parent}`)
+    }
+    const rid = p.id ?? newId()
+    const extra: Record<string, unknown> = { ...(p.extra ?? {}) }
+    extra['parent_id'] = parent
+    const rec = makePut(rid, p.ts ?? nowTs(), p.content.trim(), p.title.trim(), cleanTags(p.tags ?? []), (p.project ?? '').trim(), extra)
+    this.append(rec)
+    this.apply(rec)
+    return rid
   }
 
   /** 改挂因（新父）：追加同 id 新 put，仅换 parent_id（空串=升根）。

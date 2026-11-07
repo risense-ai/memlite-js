@@ -258,3 +258,62 @@ describe('querylog 便捷接口', () => {
     expect(mem.querylogExport(out)).toBe(2)
   })
 })
+
+describe('remember 显式 id/ts/extra（导入桥）', () => {
+  it('主类经 putFull 落库：id/ts/extra 全保留', async () => {
+    const d = tmp()
+    const mem = new Memlite({ dataDir: d })
+    const pid = await mem.remember('父条', { title: '父' })
+    const rid = await mem.remember('导入正文', {
+      id: 'fixed12fixed12',
+      ts: 1700000000,
+      title: '导入条',
+      tags: ['obsidian'],
+      project: 'demo',
+      parent: pid,
+      extra: { source_hash: 'abc', importance: 'important', kind: 'Context' },
+    })
+    expect(rid).toBe('fixed12fixed12')
+    const view = mem.show(rid)!
+    expect(view.record.ts).toBe(1700000000)
+    expect(view.record.extra['source_hash']).toBe('abc')
+    expect(view.record.extra['importance']).toBe('important')
+    expect(view.record.extra['kind']).toBe('Context')
+    // id 冲突即拒
+    await expect(
+      mem.remember('重复', { id: rid, title: '' }),
+    ).rejects.toThrow('id 已存在')
+  })
+})
+
+describe('update extra 合并', () => {
+  it('按键合并；parent_id 不随补丁变', async () => {
+    const d = tmp()
+    const mem = new Memlite({ dataDir: d })
+    const pid = await mem.remember('父条', { title: '父' })
+    const rid = await mem.remember('正文', {
+      title: '题',
+      parent: pid,
+      extra: { source_hash: 'h1', keep: 'x' },
+    })
+    await mem.update(rid, { content: '新正文', extra: { source_hash: 'h2' } })
+    const rec = mem.show(rid)!.record
+    expect(rec.content).toBe('新正文')
+    expect(rec.extra['source_hash']).toBe('h2')
+    expect(rec.extra['keep']).toBe('x')
+    expect(rec.extra['parent_id']).toBe(pid)
+  })
+})
+
+describe('attach 升根', () => {
+  it("attach(id, '') 摘到根", async () => {
+    const d = tmp()
+    const mem = new Memlite({ dataDir: d })
+    const pid = await mem.remember('父条', { title: '父' })
+    const rid = await mem.remember('子条', { parent: pid })
+    mem.attach(rid, '')
+    const rec = mem.show(rid)!.record
+    expect(rec.extra['parent_id']).toBe('')
+    expect(mem.show(pid)!.children.length).toBe(0)
+  })
+})

@@ -71,6 +71,12 @@ export interface RememberOpts {
   project?: string
   /** 认因挂载：本条之因（父）——id/前8位/纲名皆可；空=根 */
   parent?: string
+  /** 显式 id（导入桥回填 frontmatter.id 用）；已在库即拒 */
+  id?: string
+  /** 显式 ts 秒级时间戳（导入回填创建时间用）；缺省取当前 */
+  ts?: number
+  /** 额外平铺字段（source_hash/obsidian_path/importance/kind 等）；parent_id 由 parent 参数管 */
+  extra?: Record<string, unknown>
   /** 同步等待嵌入完成（缺省异步不阻塞主路径） */
   awaitEmbedding?: boolean
 }
@@ -224,7 +230,19 @@ export class Memlite {
       if (!p) throw new Error(`目标因（父）不存在: ${opts.parent}`)
       parentFull = p.id
     }
-    const rid = this.store.putChild(content, finalTitle, opts.tags ?? [], opts.project ?? '', parentFull)
+    const hasFull = opts.id !== undefined || opts.ts !== undefined || opts.extra !== undefined
+    const rid = hasFull
+      ? this.store.putFull({
+          id: opts.id,
+          ts: opts.ts,
+          content,
+          title: finalTitle,
+          tags: opts.tags ?? [],
+          project: opts.project ?? '',
+          parent: parentFull,
+          extra: opts.extra,
+        })
+      : this.store.putChild(content, finalTitle, opts.tags ?? [], opts.project ?? '', parentFull)
     const emb = this.config.embedding
     if ((emb?.provider ?? 'none') !== 'none' || this.deps.embedder) {
       const task = this.embedRecord(rid, finalTitle, content)
@@ -384,7 +402,7 @@ export class Memlite {
     return r.id
   }
 
-  /** 收编挂链：子条挂到 parent 之下（防自挂防环） */
+  /** 收编挂链：子条挂到 parent 之下（防自挂防环）；parent='' 升根 */
   attach(id: string, parent: string): { child: string; parent: string } {
     return this.attachLike(id, parent)
   }
@@ -398,6 +416,10 @@ export class Memlite {
     const s = this.store
     const child = s.resolve(id)
     if (!child) throw new Error(`记忆不存在: ${id}`)
+    if (parent === '') {
+      s.reparentChecked(child.id, '')
+      return { child: child.id, parent: '' }
+    }
     const p = s.resolve(parent)
     if (!p) throw new Error(`目标因（父）不存在: ${parent}`)
     s.reparentChecked(child.id, p.id)
@@ -447,10 +469,10 @@ export class Memlite {
     return renderTree(scope, fromFull, depth)
   }
 
-  /** 就地改一条（同 id 追加新版本；未传字段保留原值）。侧车向量跟着更新（失败不拦）。 */
+  /** 就地改一条（同 id 追加新版本；未传字段保留原值）。extra 按键合并，parent_id 不随 patch 变（改挂走 attach）。侧车向量跟着更新（失败不拦）。 */
   async update(
     id: string,
-    patch: { title?: string; content?: string; tags?: string[] },
+    patch: { title?: string; content?: string; tags?: string[]; extra?: Record<string, unknown> },
   ): Promise<{ id: string; title: string; embedded: boolean }> {
     const probe = `${patch.title ?? ''}\n${patch.content ?? ''}`
     if (probe.trim() !== '') this.scanOrReject(probe)
@@ -460,7 +482,8 @@ export class Memlite {
     const newContent = patch.content ?? old.content
     const newTags = patch.tags ?? old.tags
     if (newContent.trim() === '') throw new Error('content 不能为空')
-    this.store.putWithId(old.id, newContent, newTitle, newTags, old.project)
+    const { parent_id: _lockedParent, ...extraPatch } = patch.extra ?? {}
+    this.store.putWithId(old.id, newContent, newTitle, newTags, old.project, extraPatch)
     let embedded = false
     const embedder = await this.tryEmbedder()
     if (embedder && (embedder.dim ?? 1) !== 0) {

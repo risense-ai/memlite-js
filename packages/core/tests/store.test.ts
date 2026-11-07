@@ -267,3 +267,86 @@ describe('put_line_shape_compat', () => {
     expect(typeof rec.ts).toBe('number')
   })
 })
+
+describe('put_full', () => {
+  it('显式 id/ts/extra 存入；id 冲突即拒', () => {
+    const d = tmp()
+    const s = new Store(d)
+    const parent = s.put('父正文', '父', [], '')
+    const rid = s.putFull({
+      id: 'abcd1234abcd',
+      ts: 1700000000,
+      content: '导入正文',
+      title: '导入条',
+      tags: ['obsidian'],
+      project: 'demo',
+      parent,
+      extra: { source_hash: 'deadbeef', obsidian_path: '编程/Rust.md', importance: 'important' },
+    })
+    expect(rid).toBe('abcd1234abcd')
+    const rec = s.get(rid)!
+    expect(rec.ts).toBe(1700000000)
+    expect(rec.extra['source_hash']).toBe('deadbeef')
+    expect(rec.extra['obsidian_path']).toBe('编程/Rust.md')
+    expect(rec.extra['importance']).toBe('important')
+    expect(parentId(rec)).toBe(parent)
+    // id 冲突拒绝
+    expect(() =>
+      s.putFull({ id: rid, content: '另一条', title: '', tags: [], project: '' }),
+    ).toThrow('id 已存在')
+    // parent 不存在拒绝
+    expect(() =>
+      s.putFull({ content: '孤条', title: '', tags: [], project: '', parent: 'nonexist00' }),
+    ).toThrow('目标因（父）不存在')
+  })
+
+  it('extra 夹带 parent_id 以 parent 参数为准（防悬空指针）', () => {
+    const s = new Store(tmp())
+    const pid = s.put('父', '', [], '')
+    const rid = s.putFull({
+      content: '正文',
+      title: '',
+      tags: [],
+      project: '',
+      parent: pid,
+      extra: { parent_id: 'fake-parent' },
+    })
+    expect(parentId(s.get(rid)!)).toBe(pid)
+  })
+
+  it('无 id 自动生成；重载保留 extra', () => {
+    const d = tmp()
+    const s = new Store(d)
+    const rid = s.putFull({ content: '正文', title: '题', tags: [], project: '', ts: 123 })
+    expect(rid).not.toBe('')
+    const s2 = new Store(d)
+    expect(s2.get(rid)?.ts).toBe(123)
+  })
+})
+
+describe('put_with_id_extra_patch', () => {
+  it('extraPatch 合并覆盖，parent_id 不被补丁改写', () => {
+    const d = tmp()
+    const s = new Store(d)
+    const pid = s.put('父', '', [], '')
+    const rid = s.putFull({
+      id: 'patch01patch01',
+      content: '旧正文',
+      title: '旧题',
+      tags: [],
+      project: '',
+      parent: pid,
+      extra: { source_hash: 'h1', keep_me: 'yes' },
+    })
+    s.putWithId(rid, '新正文', '新题', ['t'], 'p', { source_hash: 'h2' })
+    const rec = s.get(rid)!
+    expect(rec.content).toBe('新正文')
+    expect(rec.title).toBe('新题')
+    expect(rec.tags).toEqual(['t'])
+    expect(rec.extra['source_hash']).toBe('h2')
+    expect(rec.extra['keep_me']).toBe('yes')
+    expect(parentId(rec)).toBe(pid)
+    const s2 = new Store(d)
+    expect(s2.get(rid)?.extra['source_hash']).toBe('h2')
+  })
+})
