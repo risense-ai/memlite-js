@@ -1,0 +1,11 @@
+name: probe-c
+on:
+  push:
+    branches: [probe-ci]
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "has token"
+        if: ${{ secrets.NPM_TOKEN != '' }}
+      - run: echo "always"
