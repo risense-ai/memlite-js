@@ -1,0 +1,10 @@
+name: probe-a
+on:
+  push:
+    branches: [probe-ci]
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo a
