@@ -472,7 +472,7 @@ export class Memlite {
   /** 就地改一条（同 id 追加新版本；未传字段保留原值）。extra 按键合并，parent_id 不随 patch 变（改挂走 attach）。侧车向量跟着更新（失败不拦）。 */
   async update(
     id: string,
-    patch: { title?: string; content?: string; tags?: string[]; extra?: Record<string, unknown> },
+    patch: { title?: string; content?: string; tags?: string[]; project?: string; extra?: Record<string, unknown> },
   ): Promise<{ id: string; title: string; embedded: boolean }> {
     const probe = `${patch.title ?? ''}\n${patch.content ?? ''}`
     if (probe.trim() !== '') this.scanOrReject(probe)
@@ -481,9 +481,10 @@ export class Memlite {
     const newTitle = patch.title ?? old.title
     const newContent = patch.content ?? old.content
     const newTags = patch.tags ?? old.tags
+    const newProject = patch.project ?? old.project
     if (newContent.trim() === '') throw new Error('content 不能为空')
     const { parent_id: _lockedParent, ...extraPatch } = patch.extra ?? {}
-    this.store.putWithId(old.id, newContent, newTitle, newTags, old.project, extraPatch)
+    this.store.putWithId(old.id, newContent, newTitle, newTags, newProject, extraPatch)
     let embedded = false
     const embedder = await this.tryEmbedder()
     if (embedder && (embedder.dim ?? 1) !== 0) {

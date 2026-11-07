@@ -317,3 +317,13 @@ describe('attach 升根', () => {
     expect(mem.show(pid)!.children.length).toBe(0)
   })
 })
+
+describe('update project', () => {
+  it('project 可随 patch 更新', async () => {
+    const d = tmp()
+    const mem = new Memlite({ dataDir: d })
+    const rid = await mem.remember('正文', { title: '题', project: 'old' })
+    await mem.update(rid, { project: 'new' })
+    expect(mem.show(rid)!.record.project).toBe('new')
+  })
+})
