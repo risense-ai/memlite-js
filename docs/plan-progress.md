@@ -11,7 +11,7 @@
 | M3 | 向量侧车 + 检索主流程 | 2 天 | ✅ 完成 |
 | M4 | 同步 | 1 天 | ✅ 完成 |
 | M5 | 嵌入 provider | 2 天 | ✅ 完成 |
-| M6 | 文档 + 发布 | 1 天 | ✅ 代码与文档完成；npm 发布与 tag 待用户确认 |
+| M6 | 文档 + 发布 | 1 天 | ✅ 完成（GitHub 已发布；npm 暂缓——用户决定）|
 | M7 | DSH 插件（独立仓库） | 下一阶段 | 不在本仓范围 |
 
 ---
@@ -170,7 +170,9 @@
 - [x] CHANGELOG（0.1.0 条目）
 - [x] GitHub Actions（lint+typecheck / test 含 compat / build / npm publish on v* tag）——`.github/workflows/ci.yml`
 - [x] 互通测试 `tests/compat.test.ts`：读 Rust 写的库 / 写 JS 给 Rust recall / 排序一致 / del 墓碑（`MEMLITE_RS_BIN` 未设时跳过）
-- [ ] 打 tag `v0.1.0`，发布 `@rsrsai/memlite@0.1.0`——**待用户确认**（GitHub 仓未创建，发布是外发动作）
+- [x] 打 tag `v0.1.0`（注解 tag 已推送，GitHub release 已建）；**npm 发布暂缓**——用户决定（npm 账号不在本机）；CI publish 任务就绪，配 `NPM_TOKEN` secret 后重推 tag 即自动发布，或本机 `npm login` 后 `cd packages/core && npm publish --access public`
+
+**GitHub 发布记录（2026-11-07）**：公开仓 https://github.com/risense-ai/memlite-js（main + tag v0.1.0 + release），CI 全绿。CI 调试三坑已修并留痕：① step 级 `if` 不支持 `secrets` 上下文（整个 workflow 秒拒、零 job）——经 `env` 传递判空；② `actions/checkout` 带 `repository:` 参数时不会检出本仓，须再补一个默认 checkout（否则 lock 文件缺失）；③ `pnpm/action-setup` 的 `version` 输入与根 package.json `packageManager` 字段冲突报 "Multiple versions of pnpm specified"——去掉 `version` 让其读 packageManager。sibling 仓 respire-memlite 为私有，CI 互通测试缺 PAT 时自动跳过（本地已实测互通）。
 
 ---
 
