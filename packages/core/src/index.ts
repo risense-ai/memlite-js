@@ -5,11 +5,14 @@ export {
   Store,
   DATA_FILE,
   CHUNK_BYTES,
+  REVISION_KEY,
+  StaleVersionError,
   parentId,
   importance,
   kind,
   nowTs,
   newId,
+  recordRevision,
   serializeRecord,
   type MemRecord,
 } from './store'
@@ -76,9 +79,9 @@ export { makeOpenAIEmbedder, EmbedError } from './embedding/openai'
 export { makeHostEmbedder } from './embedding/host'
 
 // 主类
-export { Memlite, memliteFromFiles, type MemliteConfig, type MemliteDeps, type RememberOpts, type RecallOpts, type RecallResult, type RecallHit } from './memlite'
+export { Memlite, memliteFromFiles, type MemliteConfig, type MemliteDeps, type RememberOpts, type RecallOpts, type RecallResult, type RecallHit, type WriteOptions } from './memlite'
 
 // bench 评测
 export { bench, CORPUS, type BenchResult, type CorpusItem } from './bench'
 
-export const VERSION = '0.1.0'
+export const VERSION = '0.2.0'

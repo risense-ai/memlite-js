@@ -28,6 +28,35 @@ export function parentId(r: MemRecord): string {
   return typeof v === 'string' ? v : ''
 }
 
+/** 版本字段：`extra.revision`（JSONL 平铺字段，Rust 侧 serde(flatten) 会原样保留）。 */
+export const REVISION_KEY = 'revision'
+
+/**
+ * 一条记录的修订号（条件写的比较基准）。
+ *
+ * - 新写入的记录显式带 `revision: 0`；
+ * - 旧数据（含 Rust CLI 写入、迁移库）没有该字段，用 `ts` 毫秒化作为稳定初值，
+ *   这样两个并发的旧版本读者仍会拿到同一个初值，后写者能触发冲突；
+ * - 负数/非整数按旧数据处理，不信任脏字段。
+ */
+export function recordRevision(r: MemRecord): number {
+  const v = r.extra[REVISION_KEY]
+  if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return v
+  return Number.isFinite(r.ts) ? Math.max(0, Math.round(r.ts * 1000)) : 0
+}
+
+/** 条件写冲突：expectedRevision 与当前库内版本不一致。 */
+export class StaleVersionError extends Error {
+  readonly code = 'STALE_VERSION'
+  readonly currentRevision: number
+
+  constructor(currentRevision: number) {
+    super('版本冲突：记忆已被其他窗口修改')
+    this.name = 'StaleVersionError'
+    this.currentRevision = currentRevision
+  }
+}
+
 /** 重要性（respire 迁移数据 important/trivial；新条可缺省）。 */
 export function importance(r: MemRecord): string {
   const v = r.extra['importance']
@@ -106,11 +135,40 @@ export class Store {
   readonly deleted = new Set<string>()
   badLines = 0
   private readonly chunkBytes: number
+  /** 上次加载/写入后看到的 memory*.jsonl 签名（size+mtime）；用于条件写前发现外部进程写入。 */
+  private fileSignature = ''
 
   constructor(dataDir: string, chunkBytes = CHUNK_BYTES) {
     this.dataDir = dataDir
     this.chunkBytes = chunkBytes
     this.load()
+    this.fileSignature = this.currentSignature()
+  }
+
+  /** 目录内全部 memory*.jsonl 的 size+mtime 签名（不含内容，开销有界）。 */
+  private currentSignature(): string {
+    const paths = this.files()
+    const parts: string[] = []
+    for (const p of paths) {
+      try {
+        const stat = fs.statSync(p)
+        parts.push(`${path.basename(p)}:${stat.size}:${stat.mtimeMs}`)
+      } catch {
+        parts.push(`${path.basename(p)}:missing`)
+      }
+    }
+    return parts.join('|')
+  }
+
+  /** 条件写前刷新：若其他进程追加/轮转了 JSONL，先重载索引再比较版本。 */
+  private refreshExternal(): void {
+    const signature = this.currentSignature()
+    if (signature === this.fileSignature) return
+    this.records.clear()
+    this.deleted.clear()
+    this.badLines = 0
+    this.load()
+    this.fileSignature = this.currentSignature()
   }
 
   /** 归档按序号升序（旧→新） */
@@ -181,6 +239,7 @@ export class Store {
       fs.closeSync(fd)
     }
     this.maybeRotate()
+    this.fileSignature = this.currentSignature()
   }
 
   /** 活跃文件超限即轮转（改名归档，取最大序号+1） */
@@ -217,6 +276,7 @@ export class Store {
     const rid = newId()
     const rec = makePut(rid, nowTs(), content.trim(), title.trim(), cleanTags(tags), project.trim(), {
       parent_id: parent,
+      revision: 0,
     })
     this.append(rec)
     this.apply(rec)
@@ -238,9 +298,54 @@ export class Store {
     const old = this.records.get(rid)
     const extra: Record<string, unknown> = { ...old?.extra, ...extraPatch }
     extra['parent_id'] = old ? parentId(old) : ''
+    extra[REVISION_KEY] = old ? recordRevision(old) + 1 : 0
     const rec = makePut(rid, nowTs(), content.trim(), title.trim(), cleanTags(tags), project.trim(), extra)
     this.append(rec)
     this.apply(rec)
+  }
+
+  /** 条件写：当前 revision 必须等于 expectedRevision，否则抛 StaleVersionError。
+   * 检查与写入在同一同步调用内完成，进程内并发不会出现检查—写入间隙。 */
+  putWithIdConditional(
+    rid: string,
+    content: string,
+    title: string,
+    tags: string[],
+    project: string,
+    expectedRevision: number,
+    extraPatch?: Record<string, unknown>,
+  ): void {
+    this.refreshExternal()
+    if (content.trim() === '') throw new Error('content 为空')
+    const old = this.records.get(rid)
+    if (!old) throw new Error(`记忆不存在: ${rid}`)
+    this.assertRevision(old, expectedRevision)
+    this.putWithId(rid, content, title, tags, project, extraPatch)
+  }
+
+  private assertRevision(record: MemRecord, expectedRevision: number): void {
+    const current = recordRevision(record)
+    if (!Number.isSafeInteger(expectedRevision) || current !== expectedRevision) {
+      throw new StaleVersionError(current)
+    }
+  }
+
+  /** 改挂条件写：版本不一致即冲突；防环仍由 reparentChecked 保证。 */
+  reparentCheckedConditional(rid: string, newParent: string, expectedRevision: number): void {
+    this.refreshExternal()
+    const old = this.records.get(rid)
+    if (!old) throw new Error(`记忆不存在: ${rid}`)
+    this.assertRevision(old, expectedRevision)
+    this.reparentChecked(rid, newParent)
+  }
+
+  /** 忘记条件写：版本不一致即冲突；删除后当前索引不再有该 id。 */
+  deleteConditional(rid: string, expectedRevision: number): void {
+    this.refreshExternal()
+    const old = this.records.get(rid)
+    if (!old) throw new Error(`记忆不存在: ${rid}`)
+    this.assertRevision(old, expectedRevision)
+    this.delete(rid)
   }
 
   /** 完整受控存入：显式 id/ts/extra（导入桥等客户端用）；parent 非空须已在库。
@@ -266,6 +371,11 @@ export class Store {
     const rid = p.id ?? newId()
     const extra: Record<string, unknown> = { ...(p.extra ?? {}) }
     extra['parent_id'] = parent
+    const rawRevision = extra[REVISION_KEY]
+    extra[REVISION_KEY] =
+      typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision >= 0
+        ? rawRevision
+        : 0
     const rec = makePut(rid, p.ts ?? nowTs(), p.content.trim(), p.title.trim(), cleanTags(p.tags ?? []), (p.project ?? '').trim(), extra)
     this.append(rec)
     this.apply(rec)
@@ -281,7 +391,10 @@ export class Store {
     if (newParent !== '' && !this.records.has(newParent)) {
       throw new Error(`目标因（父）不存在: ${newParent}`)
     }
-    const rec: MemRecord = { ...old, extra: { ...old.extra, parent_id: newParent } }
+    const rec: MemRecord = {
+      ...old,
+      extra: { ...old.extra, parent_id: newParent, [REVISION_KEY]: recordRevision(old) + 1 },
+    }
     this.append(rec)
     this.apply(rec)
   }

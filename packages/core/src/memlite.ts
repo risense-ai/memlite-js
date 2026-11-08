@@ -23,7 +23,13 @@ import {
 } from './querylog'
 import { recallSearch, searchOnce, type RecallBackend } from './recall'
 import { scan } from './sensitive'
-import { Store, nowTs, parentId, type MemRecord } from './store'
+import {
+  Store,
+  nowTs,
+  parentId,
+  recordRevision,
+  type MemRecord,
+} from './store'
 import * as syncMod from './sync'
 import {
   TreeScope,
@@ -86,6 +92,11 @@ export interface RecallOpts {
   project?: string
   /** 强制词面档 */
   bm25Only?: boolean
+}
+
+/** 条件写选项：给 expectedRevision 时，版本不一致抛 StaleVersionError（进程内原子）。 */
+export interface WriteOptions {
+  expectedRevision?: number
 }
 
 export interface CausalNeighbor {
@@ -394,36 +405,57 @@ export class Memlite {
       .slice(0, limit)
   }
 
-  /** 删记忆（resolve 支持 id/前缀/纲名） */
-  forget(id: string): string {
+  /** 删记忆（resolve 支持 id/前缀/纲名）；给 expectedRevision 时做条件删除。 */
+  forget(id: string, options: WriteOptions = {}): string {
     const r = this.store.resolve(id)
     if (!r) throw new Error(`记忆不存在: ${id}`)
-    this.store.delete(r.id)
+    if (options.expectedRevision !== undefined) {
+      this.store.deleteConditional(r.id, options.expectedRevision)
+    } else {
+      this.store.delete(r.id)
+    }
     return r.id
   }
 
-  /** 收编挂链：子条挂到 parent 之下（防自挂防环）；parent='' 升根 */
-  attach(id: string, parent: string): { child: string; parent: string } {
-    return this.attachLike(id, parent)
+  /** 收编挂链：子条挂到 parent 之下（防自挂防环）；parent='' 升根。 */
+  attach(
+    id: string,
+    parent: string,
+    options: WriteOptions = {},
+  ): { child: string; parent: string; revision: number } {
+    return this.attachLike(id, parent, options)
   }
 
   /** 因果下沉：本条挂到 parent 下成为其果（同一 reparent 语义） */
-  demote(id: string, parent: string): { child: string; parent: string } {
-    return this.attachLike(id, parent)
+  demote(
+    id: string,
+    parent: string,
+    options: WriteOptions = {},
+  ): { child: string; parent: string; revision: number } {
+    return this.attachLike(id, parent, options)
   }
 
-  private attachLike(id: string, parent: string): { child: string; parent: string } {
+  private attachLike(
+    id: string,
+    parent: string,
+    options: WriteOptions = {},
+  ): { child: string; parent: string; revision: number } {
     const s = this.store
     const child = s.resolve(id)
     if (!child) throw new Error(`记忆不存在: ${id}`)
-    if (parent === '') {
-      s.reparentChecked(child.id, '')
-      return { child: child.id, parent: '' }
+    let parentFull = ''
+    if (parent !== '') {
+      const p = s.resolve(parent)
+      if (!p) throw new Error(`目标因（父）不存在: ${parent}`)
+      parentFull = p.id
     }
-    const p = s.resolve(parent)
-    if (!p) throw new Error(`目标因（父）不存在: ${parent}`)
-    s.reparentChecked(child.id, p.id)
-    return { child: child.id, parent: p.id }
+    if (options.expectedRevision !== undefined) {
+      s.reparentCheckedConditional(child.id, parentFull, options.expectedRevision)
+    } else {
+      s.reparentChecked(child.id, parentFull)
+    }
+    const updated = s.get(child.id)
+    return { child: child.id, parent: parentFull, revision: updated ? recordRevision(updated) : 0 }
   }
 
   /** 因果上浮：本条升为更上游之因（挂到祖父/根，果链随之） */
@@ -469,11 +501,13 @@ export class Memlite {
     return renderTree(scope, fromFull, depth)
   }
 
-  /** 就地改一条（同 id 追加新版本；未传字段保留原值）。extra 按键合并，parent_id 不随 patch 变（改挂走 attach）。侧车向量跟着更新（失败不拦）。 */
+  /** 就地改一条（同 id 追加新版本；未传字段保留原值）。extra 按键合并，parent_id 不随 patch 变（改挂走 attach）。侧车向量跟着更新（失败不拦）。
+   * 给 options.expectedRevision 时做版本条件写：检查与 JSONL 追加在同一同步段内，冲突抛 StaleVersionError。 */
   async update(
     id: string,
     patch: { title?: string; content?: string; tags?: string[]; project?: string; extra?: Record<string, unknown> },
-  ): Promise<{ id: string; title: string; embedded: boolean }> {
+    options: WriteOptions = {},
+  ): Promise<{ id: string; title: string; embedded: boolean; revision: number }> {
     const probe = `${patch.title ?? ''}\n${patch.content ?? ''}`
     if (probe.trim() !== '') this.scanOrReject(probe)
     const old = this.store.resolve(id)
@@ -484,7 +518,21 @@ export class Memlite {
     const newProject = patch.project ?? old.project
     if (newContent.trim() === '') throw new Error('content 不能为空')
     const { parent_id: _lockedParent, ...extraPatch } = patch.extra ?? {}
-    this.store.putWithId(old.id, newContent, newTitle, newTags, newProject, extraPatch)
+    if (options.expectedRevision !== undefined) {
+      this.store.putWithIdConditional(
+        old.id,
+        newContent,
+        newTitle,
+        newTags,
+        newProject,
+        options.expectedRevision,
+        extraPatch,
+      )
+    } else {
+      this.store.putWithId(old.id, newContent, newTitle, newTags, newProject, extraPatch)
+    }
+    const updated = this.store.get(old.id)
+    const revision = updated ? recordRevision(updated) : 0
     let embedded = false
     const embedder = await this.tryEmbedder()
     if (embedder && (embedder.dim ?? 1) !== 0) {
@@ -500,7 +548,7 @@ export class Memlite {
         )
       }
     }
-    return { id: old.id, title: newTitle, embedded }
+    return { id: old.id, title: newTitle, embedded, revision }
   }
 
   /** 给无向量的记忆批量回填（ts 升序；已有向量跳过；维度变更拒收并计入 failed）。 */

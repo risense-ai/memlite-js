@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 (2026-11-08)
+
+### 条件写与版本守卫
+
+- 新增 `extra.revision` 版本字段：新记录从 0 起，更新/改挂递增；Rust 侧 `serde(flatten)` 原样保留，JSONL 互通不破坏
+- `recordRevision()`：旧数据无版本字段时以 `ts` 毫秒化作为稳定初值，避免同秒更新无法判冲突
+- `Memlite.update/attach/forget` 接受 `{ expectedRevision }`：检查与追加在同一同步段完成，进程内并发不会静默覆盖
+- 新增 `StaleVersionError`（`code='STALE_VERSION'`），直接暴露当前 revision 供 UI 展示与草稿保留
+- `update` 返回值新增 `revision`，`attach` 返回值新增 `revision`
+
 ## 0.1.0 (2026-11-07)
 
 首个版本。与 [respire-memlite](https://github.com/risense-ai/respire-memlite)（Rust）数据互通的核心库。
