@@ -6,7 +6,7 @@
 import { defaultTitle } from './bm25'
 import * as path from 'node:path'
 import type { ConfigCtx } from './config'
-import { embeddingMerged, resolveDataDir, userDataDir } from './config'
+import { concurrencyMerged, embeddingMerged, resolveDataDir, userDataDir } from './config'
 import { noneEmbedder } from './embedding/none'
 import { makeOpenAIEmbedder } from './embedding/openai'
 import type {
@@ -24,11 +24,13 @@ import {
 import { recallSearch, searchOnce, type RecallBackend } from './recall'
 import { scan } from './sensitive'
 import {
+  CHUNK_BYTES,
   Store,
   nowTs,
   parentId,
   recordRevision,
   type MemRecord,
+  type StoreSnapshot,
 } from './store'
 import * as syncMod from './sync'
 import {
@@ -42,6 +44,7 @@ import {
   type TreeNode,
 } from './tree'
 import { VectorIndex } from './vectors'
+import type { ConcurrencyConfig } from './lock'
 
 export interface MemliteConfig {
   /** 缺省走 resolveDataDir（CLI > MEMLITE_DATA > 工作区 > 用户级 > ~/memlite-data） */
@@ -62,6 +65,8 @@ export interface MemliteConfig {
   }
   /** 默认 true */
   sensitiveGate?: boolean
+  /** 并发协议（默认 single-writer/local；多进程需显式开启） */
+  concurrency?: ConcurrencyConfig
 }
 
 export interface MemliteDeps extends EmbedderDeps {
@@ -129,8 +134,8 @@ const DEFAULT_MODEL = 'BAAI/bge-m3'
 const DEFAULT_TIMEOUT_MS = 30_000
 
 export class Memlite {
-  readonly config: Required<Omit<MemliteConfig, 'dataDir' | 'sync' | 'embedding'>> &
-    Pick<MemliteConfig, 'dataDir' | 'sync' | 'embedding'>
+  readonly config: Required<Omit<MemliteConfig, 'dataDir' | 'sync' | 'embedding' | 'concurrency'>> &
+    Pick<MemliteConfig, 'dataDir' | 'sync' | 'embedding' | 'concurrency'>
   private readonly deps: MemliteDeps
   private storeRef: Store | undefined
   private vectorsRef: VectorIndex | undefined
@@ -143,6 +148,7 @@ export class Memlite {
       dataDir: config.dataDir,
       sync: config.sync,
       embedding: config.embedding,
+      concurrency: config.concurrency,
       recallLimit: config.recallLimit ?? 10,
       sensitiveGate: config.sensitiveGate ?? true,
     }
@@ -162,19 +168,39 @@ export class Memlite {
   }
 
   get vectors(): VectorIndex {
-    if (!this.vectorsRef) this.vectorsRef = new VectorIndex(this.dataDir)
+    if (!this.vectorsRef) {
+      this.vectorsRef = new VectorIndex(this.dataDir, {
+        concurrency: this.config.concurrency,
+        logger: this.logger,
+      })
+    }
     return this.vectorsRef
+  }
+
+  /** 同一代次的只读快照（recall/show/list/tree/status 共用，避免跨代拼装）。 */
+  snapshot(): StoreSnapshot {
+    return this.store.snapshot('memlite.snapshot')
   }
 
   /** 检索日志常驻视图（counts 全量聚合） */
   get log(): Log {
-    if (!this.logRef) this.logRef = new Log(this.dataDir)
+    if (!this.logRef) {
+      this.logRef = new Log(this.dataDir, {
+        concurrency: this.config.concurrency,
+        logger: this.logger,
+      })
+    }
     return this.logRef
   }
 
   /** 打开（幂等；DSH 插件在 ctx.on('ready') 调） */
   open(): this {
-    if (!this.storeRef) this.storeRef = new Store(this.dataDir)
+    if (!this.storeRef) {
+      this.storeRef = new Store(this.dataDir, CHUNK_BYTES, {
+        concurrency: this.config.concurrency,
+        logger: this.logger,
+      })
+    }
     return this
   }
 
@@ -237,7 +263,7 @@ export class Memlite {
     const finalTitle = title.trim() === '' ? defaultTitle(content) : title.trim()
     let parentFull = ''
     if (opts.parent && opts.parent !== '') {
-      const p = this.store.resolve(opts.parent)
+      const p = this.snapshot().resolve(opts.parent)
       if (!p) throw new Error(`目标因（父）不存在: ${opts.parent}`)
       parentFull = p.id
     }
@@ -254,29 +280,53 @@ export class Memlite {
           extra: opts.extra,
         })
       : this.store.putChild(content, finalTitle, opts.tags ?? [], opts.project ?? '', parentFull)
+    const committed = this.store.peek(rid)
+    const revision = committed ? recordRevision(committed) : 0
     const emb = this.config.embedding
     if ((emb?.provider ?? 'none') !== 'none' || this.deps.embedder) {
-      const task = this.embedRecord(rid, finalTitle, content)
+      const task = this.embedRecord(rid, finalTitle, content, revision)
       if (opts.awaitEmbedding) await task
     }
     return rid
   }
 
   /** 侧车异步写入：失败不拦存入，只记日志。 */
-  private async embedRecord(rid: string, title: string, content: string): Promise<boolean> {
+  private async embedRecord(
+    rid: string,
+    title: string,
+    content: string,
+    revision: number,
+  ): Promise<boolean> {
     try {
       const embedder = await this.resolveEmbedder()
       if ((embedder.dim ?? 1) === 0) return false
       const v = await embedder.embed(`${title}\n${content}`)
       if (v.length === 0) return false
-      this.vectors.put(rid, v)
-      return true
+      return this.writeVectorIfCurrent(rid, v, revision)
     } catch (e) {
       this.logger.warn(
         `记忆 ${rid} 嵌入失败，将被语义档跳过: ${e instanceof Error ? e.message : String(e)}`,
       )
       return false
     }
+  }
+
+  /**
+   * 向量写入：数据共享锁保证 revision 在“校验—落盘”期间不变，
+   * 向量排他锁内再做一次 revision 对照；内容已变或记录已删则不写。
+   */
+  private writeVectorIfCurrent(rid: string, vector: ArrayLike<number>, revision: number): boolean {
+    return this.store.withSnapshot('memlite.vector-write', (snap) => {
+      const current = snap.get(rid)
+      if (!current || recordRevision(current) !== revision) return false
+      return this.vectors.put(rid, vector, {
+        revision,
+        validate: () => {
+          const r = snap.get(rid)
+          return r ? recordRevision(r) : undefined
+        },
+      })
+    })
   }
 
   /** 检索：BM25 必算 → 嵌入 → RRF；项目级无命中回退用户级；写 querylog；带因果视界。 */
@@ -286,9 +336,10 @@ export class Memlite {
     const project = opts.project ?? ''
     const bm25Only = opts.bm25Only ?? false
     const embedder = await this.tryEmbedder()
+    const snap = this.store.snapshot('recall')
     let { backend, hits } = await searchOnce(
-      this.store.all(),
-      this.vectors,
+      snap.all(),
+      bm25Only ? undefined : this.safeVectors(this.dataDir),
       embedder,
       query,
       { limit, project, bm25Only },
@@ -296,14 +347,17 @@ export class Memlite {
     )
     // 两档查序：解析库非用户级（项目级）且没搜到 → 自动回退用户级
     let fallbacked = false
-    let causalStore = this.store
+    let causalStore: StoreSnapshot = snap
     const userDir = userDataDir(this.deps.ctx)
     if (hits.length === 0 && normalize(this.dataDir) !== normalize(userDir)) {
-      const userStore = new Store(userDir)
-      const userVec = new VectorIndex(userDir)
+      const userStore = new Store(userDir, CHUNK_BYTES, {
+        concurrency: this.config.concurrency,
+        logger: this.logger,
+      })
+      const userSnap = userStore.snapshot('recall.user')
       const r2 = await searchOnce(
-        userStore.all(),
-        userVec,
+        userSnap.all(),
+        bm25Only ? undefined : this.safeVectors(userDir),
         embedder,
         query,
         { limit, project, bm25Only },
@@ -313,7 +367,7 @@ export class Memlite {
         backend = r2.backend
         hits = r2.hits
         fallbacked = true
-        causalStore = userStore
+        causalStore = userSnap
       }
     }
     // 落检索日志：一次查询一行（含零命中与回退），失败只提示不拦检索
@@ -341,7 +395,21 @@ export class Memlite {
     }
   }
 
-  private toRecallHit(causalStore: Store, score: number, r: MemRecord): RecallHit {
+  /** 向量文件损坏不应拖垮词面检索：构造失败只告警并回退 BM25。 */
+  private safeVectors(dir: string): VectorIndex | undefined {
+    try {
+      if (normalize(dir) === normalize(this.dataDir)) return this.vectors
+      return new VectorIndex(dir, {
+        concurrency: this.config.concurrency,
+        logger: this.logger,
+      })
+    } catch (e) {
+      this.logger.warn(`向量侧车不可用，回退 BM25: ${e instanceof Error ? e.message : String(e)}`)
+      return undefined
+    }
+  }
+
+  private toRecallHit(causalStore: StoreSnapshot, score: number, r: MemRecord): RecallHit {
     return {
       score: Math.round(score * 10000) / 10000,
       id: r.id,
@@ -375,9 +443,9 @@ export class Memlite {
     children: Array<CausalNeighbor & { summary: string }>
     causalLines: string[]
   } | undefined {
-    const r = this.store.resolve(id)
+    const s = this.snapshot()
+    const r = s.resolve(id)
     if (!r) return undefined
-    const s = this.store
     const titleOf = (pid: string): string => {
       const p = s.records.get(pid)
       return p && p.title !== '' ? p.title : pid.slice(0, 8)
@@ -399,7 +467,7 @@ export class Memlite {
 
   /** 列最近（ts 降序） */
   list(limit = 20): MemRecord[] {
-    return this.store
+    return this.snapshot()
       .all()
       .sort((a, b) => b.ts - a.ts)
       .slice(0, limit)
@@ -465,7 +533,7 @@ export class Memlite {
     if (!me) throw new Error(`记忆不存在: ${id}`)
     const oldParent = parentId(me)
     if (oldParent === '') return { id: me.id, newParent: '' }
-    const parentRec = s.records.get(oldParent)
+    const parentRec = s.get(oldParent)
     // 新因 = 原因的因（祖父）；祖父不在库则升根
     const grandparent = parentRec ? parentId(parentRec) : ''
     s.reparentChecked(me.id, grandparent)
@@ -474,9 +542,10 @@ export class Memlite {
 
   /** 因果链深挖：因链全文（根在前）+ 本条 + 果链下探 depth 层 */
   chain(id: string, depth = 3): ChainView {
-    const r = this.store.resolve(id)
+    const s = this.snapshot()
+    const r = s.resolve(id)
     if (!r) throw new Error(`记忆不存在: ${id}`)
-    return chainView(this.store, r.id, depth)
+    return chainView(s, r.id, depth)
   }
 
   /** 因果树渲染（mode 缺省 render；from 支持 id/前8位/纲名） */
@@ -485,13 +554,14 @@ export class Memlite {
     | { lines: string[]; count: number }
     | TreeNode[] {
     const depth = opts.depth ?? 3
+    const s = this.snapshot()
     let fromFull: string | undefined
     if (opts.from !== undefined && opts.from !== '') {
-      const r = this.store.resolve(opts.from)
+      const r = s.resolve(opts.from)
       if (!r) throw new Error(`记忆不存在: ${opts.from}`)
       fromFull = r.id
     }
-    const scope = new TreeScope(this.store)
+    const scope = new TreeScope(s)
     const mode = opts.mode ?? 'render'
     if (mode === 'outline') {
       const [lines, count] = outline(scope, fromFull)
@@ -510,7 +580,7 @@ export class Memlite {
   ): Promise<{ id: string; title: string; embedded: boolean; revision: number }> {
     const probe = `${patch.title ?? ''}\n${patch.content ?? ''}`
     if (probe.trim() !== '') this.scanOrReject(probe)
-    const old = this.store.resolve(id)
+    const old = this.snapshot().resolve(id)
     if (!old) throw new Error(`记忆不存在: ${id}`)
     const newTitle = patch.title ?? old.title
     const newContent = patch.content ?? old.content
@@ -531,17 +601,14 @@ export class Memlite {
     } else {
       this.store.putWithId(old.id, newContent, newTitle, newTags, newProject, extraPatch)
     }
-    const updated = this.store.get(old.id)
+    const updated = this.store.peek(old.id)
     const revision = updated ? recordRevision(updated) : 0
     let embedded = false
     const embedder = await this.tryEmbedder()
     if (embedder && (embedder.dim ?? 1) !== 0) {
       try {
         const v = await embedder.embed(`${newTitle}\n${newContent}`)
-        if (v.length > 0) {
-          this.vectors.put(old.id, v)
-          embedded = true
-        }
+        if (v.length > 0) embedded = this.writeVectorIfCurrent(old.id, v, revision)
       } catch (e) {
         this.logger.warn(
           `记忆 ${old.id} 嵌入失败，将被语义档跳过: ${e instanceof Error ? e.message : String(e)}`,
@@ -551,7 +618,7 @@ export class Memlite {
     return { id: old.id, title: newTitle, embedded, revision }
   }
 
-  /** 给无向量的记忆批量回填（ts 升序；已有向量跳过；维度变更拒收并计入 failed）。 */
+  /** 给缺向量或向量已过期的记忆批量回填（ts 升序；按批计算、逐批受锁提交）。 */
   async reembed(opts: { batchSize?: number } = {}): Promise<{
     total: number
     embedded: number
@@ -560,20 +627,28 @@ export class Memlite {
   }> {
     const embedder = await this.resolveEmbedder()
     if ((embedder.dim ?? 0) === 0) throw new Error('嵌入档未开启')
-    void opts
-    const all = this.store.all().sort((a, b) => a.ts - b.ts)
+    const batchSize = Math.min(Math.max(Math.trunc(opts.batchSize ?? 16), 1), 1_000)
+    const all = this.snapshot().all().sort((a, b) => a.ts - b.ts)
+    const vecSnap = this.vectors.snapshot('reembed.scan')
+    const pending = all.filter((r) => {
+      if (!vecSnap.has(r.id)) return true
+      const recorded = vecSnap.revisionOf(r.id)
+      return recorded !== undefined && recorded !== recordRevision(r)
+    })
     const failures: string[] = []
     let done = 0
-    for (const r of all) {
-      if (this.vectors.has(r.id)) continue
-      try {
-        const v = await embedder.embed(`${r.title}\n${r.content}`)
-        if (v.length > 0) {
-          this.vectors.put(r.id, v)
-          done++
+    for (let i = 0; i < pending.length; i += batchSize) {
+      const batch = pending.slice(i, i + batchSize)
+      for (const r of batch) {
+        const revision = recordRevision(r)
+        try {
+          const v = await embedder.embed(`${r.title}\n${r.content}`)
+          if (v.length === 0) continue
+          if (this.writeVectorIfCurrent(r.id, v, revision)) done++
+          else failures.push(`${r.id}: 嵌入期间记忆已更新或删除，跳过`)
+        } catch (e) {
+          failures.push(`${r.id}: ${e instanceof Error ? e.message : String(e)}`)
         }
-      } catch (e) {
-        failures.push(`${r.id}: ${e instanceof Error ? e.message : String(e)}`)
       }
     }
     return { total: all.length, embedded: done, failed: failures.length, failures }
@@ -586,7 +661,10 @@ export class Memlite {
 
   /** 一次完整 git 同步（白名单 add + pathspec commit + rebase + push + sha 核验） */
   sync(): ReturnType<typeof syncMod.sync> {
-    return syncMod.sync(this.dataDir)
+    return syncMod.sync(this.dataDir, {
+      concurrency: this.config.concurrency,
+      logger: this.logger,
+    })
   }
 
   /** 压实：只留存活重写回单文件，删归档。返回压实前行数。 */
@@ -594,12 +672,22 @@ export class Memlite {
     return this.store.compact()
   }
 
-  /** 全库状态概览 */
+  /** 全库状态概览（同一代次快照；并发/锁后端一并可诊断）。 */
   async status(): Promise<Record<string, unknown>> {
     const s = this.store
+    const snap = s.snapshot('status')
     const embedder = this.deps.embedder
     const emb = this.config.embedding
     const files = s.fileStats().map(([file, bytes]) => ({ file, bytes }))
+    let vectorStatus: Record<string, unknown>
+    try {
+      vectorStatus = this.vectors.status()
+    } catch (e) {
+      vectorStatus = {
+        error: 'VECTOR_CORRUPT',
+        message: e instanceof Error ? e.message : String(e),
+      }
+    }
     let syncStatus: unknown
     try {
       syncStatus = await this.syncStatus()
@@ -608,11 +696,15 @@ export class Memlite {
     }
     return {
       data_dir: this.dataDir,
-      records: s.count(),
+      records: snap.count(),
       lines: s.lineCount(),
-      bad_lines: s.badLines,
+      bad_lines: snap.badLines,
+      generation: snap.generation,
       files,
-      vectors: this.vectors.count(),
+      // 兼容旧宿主：vectors 仍是数量；详细状态在 vector_status
+      vectors: typeof vectorStatus['count'] === 'number' ? vectorStatus['count'] : 0,
+      vector_status: vectorStatus,
+      concurrency: s.concurrencyStatus(),
       querylog: LOG_FILE,
       embedding: {
         provider: emb?.provider ?? 'none',
@@ -637,7 +729,10 @@ export class Memlite {
 
   /** 检索日志：导出训练集 */
   querylogExport(out: string, since = 0): number {
-    return exportLog(this.dataDir, out, since)
+    return exportLog(this.dataDir, out, since, {
+      concurrency: this.config.concurrency,
+      logger: this.logger,
+    })
   }
 }
 
@@ -655,6 +750,7 @@ export function memliteFromFiles(deps: MemliteDeps = {}, ctx?: ConfigCtx): Memli
   const model = typeof merged['model'] === 'string' ? merged['model'] : undefined
   const config: MemliteConfig = {
     dataDir: resolveDataDir(undefined, ctx),
+    concurrency: concurrencyMerged(ctx),
     embedding:
       apiBase && apiKey && model
         ? { provider: 'openai-compatible', apiBase, model }

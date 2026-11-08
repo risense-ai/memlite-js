@@ -3,8 +3,11 @@
 // 存储层
 export {
   Store,
+  StoreSnapshot,
   DATA_FILE,
   CHUNK_BYTES,
+  META_FILE,
+  STORAGE_PROTOCOL,
   REVISION_KEY,
   StaleVersionError,
   parentId,
@@ -15,7 +18,40 @@ export {
   recordRevision,
   serializeRecord,
   type MemRecord,
+  type StoreOptions,
+  type StoreConcurrencyStatus,
+  type TreeSource,
 } from './store'
+
+// 并发协议：跨进程锁、锁错误、文件系统检测与 NFS 探针
+export {
+  LockManager,
+  ConcurrencyError,
+  LockTimeoutError,
+  LockUnsupportedError,
+  SnapshotChangedError,
+  DATA_LOCK,
+  VECTOR_LOCK,
+  LOG_LOCK,
+  DEFAULT_LOCK_TIMEOUT_MS,
+  MIN_LOCK_TIMEOUT_MS,
+  MAX_LOCK_TIMEOUT_MS,
+  resolveConcurrency,
+  detectFilesystem,
+  probeNfs,
+  loadFsExt,
+  resetFsExtCache,
+  resetNfsProbeCache,
+  type ConcurrencyConfig,
+  type ConcurrencyMode,
+  type FilesystemMode,
+  type LockBackend,
+  type LockKind,
+  type LockMode,
+  type ResolvedConcurrency,
+  type FilesystemInfo,
+  type NfsProbeResult,
+} from './lock'
 
 // 分词与检索
 export { tokenize, isCjk } from './tokenize'
@@ -24,7 +60,16 @@ export { cosine, semantic } from './cosine'
 export { rrfFuse } from './rrf'
 
 // 向量侧车
-export { VectorIndex } from './vectors'
+export {
+  VectorIndex,
+  VectorCorruptError,
+  VECTOR_F32,
+  VECTOR_IDS,
+  VECTOR_META,
+  type VectorSnapshot,
+  type VectorPutOptions,
+  type VectorOptions,
+} from './vectors'
 
 // 因果树
 export {
@@ -52,18 +97,19 @@ export {
   userDataDir,
   resolveDataDir,
   embeddingMerged,
+  concurrencyMerged,
   configSet,
   type ConfigCtx,
 } from './config'
 
 // 检索日志
-export { Log, appendLine, exportLog, LOG_FILE, type Entry, type Hit } from './querylog'
+export { Log, appendLine, exportLog, LOG_FILE, type Entry, type Hit, type LogOptions } from './querylog'
 
 // 检索主流程
 export { recallSearch, searchOnce, type RecallBackend, type SearchOnceOpts, type SearchOnceResult } from './recall'
 
 // 同步
-export { whitelisted, findRepo, status, sync, type SyncReport, type SyncStatus } from './sync'
+export { whitelisted, findRepo, status, sync, type SyncReport, type SyncStatus, type SyncOptions } from './sync'
 
 // 嵌入档
 export type {
@@ -84,4 +130,4 @@ export { Memlite, memliteFromFiles, type MemliteConfig, type MemliteDeps, type R
 // bench 评测
 export { bench, CORPUS, type BenchResult, type CorpusItem } from './bench'
 
-export const VERSION = '0.2.0'
+export const VERSION = '0.3.0'

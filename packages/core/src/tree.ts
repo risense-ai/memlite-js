@@ -2,7 +2,7 @@
  * 因果树与因果链：树作用域、子树渲染、outline 目录、chain 深挖、recall/show 的因果视界行。
  * 语义对齐 respire（memocap CLI）：父=因/子=果，根在前，trivial 出树、父失效提根。
  */
-import { importance, kind, parentId, type MemRecord, type Store } from './store'
+import { importance, kind, parentId, type MemRecord, type TreeSource } from './store'
 
 /** 纲 L1 概览取父内容头的字数（对齐 respire ANCESTOR_PARENT_CAP=140） */
 export const PARENT_L1_CAP = 140
@@ -13,7 +13,7 @@ export class TreeScope {
   private readonly kids: Map<string, string[]>
   readonly roots: string[]
 
-  constructor(store: Store) {
+  constructor(store: TreeSource) {
     const inScope = new Set<string>()
     for (const r of store.records.values()) {
       if (importance(r) !== 'trivial') inScope.add(r.id)
@@ -167,7 +167,7 @@ export interface ChainView {
   descendants: Array<[number, MemRecord]>
 }
 
-export function chainView(store: Store, id: string, depth: number): ChainView {
+export function chainView(store: TreeSource, id: string, depth: number): ChainView {
   const entry = store.records.get(id)
   if (!entry) throw new Error(`记忆不存在: ${id}`)
   const ancestors = store
@@ -193,7 +193,7 @@ export function chainView(store: Store, id: string, depth: number): ChainView {
 /** recall/show 因果视界行（对齐 respire print_causal）：
  * 🔺因链标题链 → ▸纲L1 父内容头 → 🔻果（3 子带摘要 + 各孙标题）→ 超量提示走 chain。
  * 返回行列表（无父无子返回空）。 */
-export function causalLines(store: Store, id: string): string[] {
+export function causalLines(store: TreeSource, id: string): string[] {
   const out: string[] = []
   const titleOf = (pid: string): string => {
     const p = store.records.get(pid)

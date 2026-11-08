@@ -19,6 +19,9 @@
 - [计划](./docs/plan.md)——里程碑与任务拆解
 - [进度](./docs/plan-progress.md)——逐项打勾的实施记录
 - [互通契约](./docs/compat.md)——与 Rust memlite 的数据契约
+- [多进程与 NFS 方案](./docs/concurrency-proposal.md)——级别 0/1/2 的锁与一致性设计
+- [多进程与 NFS 计划](./docs/concurrency-plan.md)——M0–M5 实施与验收
+- [并发实施进度](./docs/concurrency-progress.md)——JS 端已交付范围、实测证据与未完成边界
 - [嵌入档详设](./docs/embedding.md)——三档 provider 与密钥管理
 - [变更记录](./CHANGELOG.md)
 

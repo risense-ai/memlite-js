@@ -8,6 +8,14 @@
  */
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  MAX_LOCK_TIMEOUT_MS,
+  MIN_LOCK_TIMEOUT_MS,
+  type ConcurrencyConfig,
+  type ConcurrencyMode,
+  type FilesystemMode,
+} from './lock'
 
 /** 可注入的环境上下文（测试用；缺省取真实 process）。 */
 export interface ConfigCtx {
@@ -90,6 +98,26 @@ export function resolveDataDir(cli: string | undefined, ctx?: ConfigCtx): string
 }
 
 /** embedding 合并：用户级为底、项目级覆盖、env 最后覆盖（操作者意图最优先） */
+/** concurrency 合并：用户级为底、项目级覆盖；文件里用 snake_case，TS 侧归一为 camelCase。 */
+export function concurrencyMerged(ctx?: ConfigCtx): ConcurrencyConfig {
+  const user = loadConfig(userConfigPath(ctx))
+  const [, proj] = projectConfig(ctx)
+  const out: Record<string, unknown> = {}
+  for (const src of [user?.['concurrency'], proj?.['concurrency']]) {
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      Object.assign(out, src as Record<string, unknown>)
+    }
+  }
+  const cfg: ConcurrencyConfig = {}
+  const mode = out['mode']
+  if (typeof mode === 'string') cfg.mode = mode as ConcurrencyMode
+  const filesystem = out['filesystem']
+  if (typeof filesystem === 'string') cfg.filesystem = filesystem as FilesystemMode
+  const timeout = out['lock_timeout_ms'] ?? out['lockTimeoutMs']
+  if (typeof timeout === 'number') cfg.lockTimeoutMs = timeout
+  return cfg
+}
+
 export function embeddingMerged(ctx?: ConfigCtx): Record<string, unknown> {
   const user = loadConfig(userConfigPath(ctx))
   const [, proj] = projectConfig(ctx)
@@ -133,18 +161,51 @@ export function configSet(key: string, value: string, project: boolean, ctx?: Co
     const [sec, field] = keys
     const sub = cfg[sec]
     if (!(sub && typeof sub === 'object' && !Array.isArray(sub))) cfg[sec] = {}
-    ;(cfg[sec] as Record<string, unknown>)[field] = value
+    ;(cfg[sec] as Record<string, unknown>)[field] = valueInto(`${sec}.${field}`, value, ctx)
   } else {
     throw new Error(`key 只支持一层或两层（如 embedding.api_base）: ${key}`)
   }
   fs.mkdirSync(path.dirname(p), { recursive: true })
-  fs.writeFileSync(p, JSON.stringify(cfg, null, 2))
+  atomicWriteText(p, JSON.stringify(cfg, null, 2))
   return p
 }
 
-/** data_dir 这类路径值原样存（并展开 ~/），其余按字符串存（不猜类型，简单可预期） */
-function valueInto(key: string, value: string, ctx?: ConfigCtx): string {
+function atomicWriteText(file: string, text: string): void {
+  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+  const fd = fs.openSync(tmp, 'w')
+  try {
+    fs.writeSync(fd, text)
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
+  fs.renameSync(tmp, file)
+}
+
+/** data_dir 展开 ~/；concurrency 枚举与超时做范围校验；其余按字符串存。 */
+function valueInto(key: string, value: string, ctx?: ConfigCtx): string | number {
   if (key === 'data_dir') return shellexpandHome(value, homeDir(ctx))
+  if (key === 'concurrency.mode') {
+    if (value !== 'single-writer' && value !== 'multi-process') {
+      throw new Error(`concurrency.mode 非法: ${value}（single-writer | multi-process）`)
+    }
+    return value
+  }
+  if (key === 'concurrency.filesystem') {
+    if (value !== 'auto' && value !== 'local' && value !== 'nfs') {
+      throw new Error(`concurrency.filesystem 非法: ${value}（auto | local | nfs）`)
+    }
+    return value
+  }
+  if (key === 'concurrency.lock_timeout_ms') {
+    const n = Number(value)
+    if (!Number.isSafeInteger(n) || n < MIN_LOCK_TIMEOUT_MS || n > MAX_LOCK_TIMEOUT_MS) {
+      throw new Error(
+        `concurrency.lock_timeout_ms 须为 ${MIN_LOCK_TIMEOUT_MS}..${MAX_LOCK_TIMEOUT_MS} 的整数`,
+      )
+    }
+    return n
+  }
   return value
 }
 

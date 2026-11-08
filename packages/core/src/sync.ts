@@ -3,12 +3,33 @@
  * 白名单 glob（memory*.jsonl/meta.json/README.md）+ push 后双通道核验 sha。
  * 向量文件（emb.f32/emb-ids.txt）不在白名单——本机可重算（reembed），不入 git。
  */
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
+import {
+  LockManager,
+  SnapshotChangedError,
+  type ConcurrencyConfig,
+} from './lock'
 
 const execFileP = promisify(execFile)
+
+/** 锁内 add：git 只读工作区文件，必须在数据共享锁内冻结 index。 */
+function gitSync(repo: string, args: string[]): void {
+  try {
+    execFileSync('git', ['-C', repo, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message?: string }
+    const stderr = typeof err.stderr === 'string' ? err.stderr : err.stderr?.toString() ?? ''
+    throw new Error(`git ${args.join(' ')} 失败: ${stderr.trim() || err.message || String(e)}`)
+  }
+}
+
+export interface SyncOptions {
+  concurrency?: ConcurrencyConfig
+  logger?: { warn(msg: string): void }
+}
 
 async function git(repo: string, args: string[]): Promise<string> {
   try {
@@ -119,8 +140,9 @@ export interface SyncReport {
 }
 
 /** 一次完整同步。data_dir 可以是仓本身或仓内子目录（项目级记忆文件夹）——
- * 白名单文件在 data_dir 下找，git 操作在仓库根做，add 用相对仓库根的路径。 */
-export async function sync(dataDir: string): Promise<SyncReport> {
+ * 白名单文件在 data_dir 下找，git 操作在仓库根做，add 用相对仓库根的路径。
+ * add 在数据共享锁内冻结 index；release 后才 commit/rebase/push，期间新增写入不混入本次提交。 */
+export async function sync(dataDir: string, options: SyncOptions = {}): Promise<SyncReport> {
   const repo = findRepo(dataDir)
   if (!repo) {
     throw new Error(`${dataDir} 及其上层目录都不是 git 仓；先 git init 或 git clone`)
@@ -131,12 +153,44 @@ export async function sync(dataDir: string): Promise<SyncReport> {
     )
   }
   const prefix = path.relative(repo, dataDir)
+  const lock = new LockManager({
+    dataDir,
+    concurrency: options.concurrency,
+    logger: options.logger,
+  })
 
-  // 1. 只 add 白名单（仓根视角的相对路径）
-  const files = whitelisted(dataDir)
-  const addPaths = files.map((f) => (prefix ? path.join(prefix, f) : f))
+  // 1. 数据共享锁内只 add 白名单（仓根视角的相对路径）；index 即本次同步的时点快照
+  let files = whitelisted(dataDir)
+  let addPaths = files.map((f) => (prefix ? path.join(prefix, f) : f))
+  let generation = snapshotGeneration(dataDir)
   if (addPaths.length > 0) {
-    await git(repo, ['add', '--', ...addPaths])
+    lock.withLock(
+      'data',
+      'shared',
+      'sync.add',
+      () => gitSync(repo, ['add', '--', ...addPaths]),
+      { createDir: false },
+    )
+  }
+
+  // 2. add 后、commit 前若代次已变，重取一次快照；再变则明确中止，不把未审核新增混入
+  const afterAdd = snapshotGeneration(dataDir)
+  if (afterAdd !== generation) {
+    files = whitelisted(dataDir)
+    addPaths = files.map((f) => (prefix ? path.join(prefix, f) : f))
+    generation = afterAdd
+    if (addPaths.length > 0) {
+      lock.withLock(
+        'data',
+        'shared',
+        'sync.refresh',
+        () => gitSync(repo, ['add', '--', ...addPaths]),
+        { createDir: false },
+      )
+    }
+    if (snapshotGeneration(dataDir) !== generation) {
+      throw new SnapshotChangedError(dataDir, 'sync')
+    }
   }
 
   // 2. 只提交白名单文件——commit 必须带路径限定！否则会把工作区里
@@ -178,6 +232,29 @@ export async function sync(dataDir: string): Promise<SyncReport> {
     )
   }
   return { committed, local_sha: localSha, remote_sha: remoteSha, verified, repo }
+}
+
+/** 白名单数据的稳定代次（文件名+size+mtime+inode）；锁文件/向量/日志不入。 */
+function snapshotGeneration(dataDir: string): string {
+  const parts: string[] = []
+  let names: string[] = []
+  try {
+    names = fs.readdirSync(dataDir)
+  } catch {
+    return ''
+  }
+  for (const name of names.sort()) {
+    if (!/^memory-\d+\.jsonl$/.test(name) && name !== 'memory.jsonl' && name !== 'meta.json') {
+      continue
+    }
+    try {
+      const stat = fs.statSync(path.join(dataDir, name), { bigint: true })
+      parts.push(`${name}:${stat.size}:${stat.mtimeNs}:${stat.ino}`)
+    } catch {
+      parts.push(`${name}:missing`)
+    }
+  }
+  return parts.join('|')
 }
 
 /** 本地时间格式化（避免引入 chrono 依赖） */

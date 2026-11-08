@@ -6,8 +6,8 @@
 import { bm25, type Scored } from './bm25'
 import { semantic } from './cosine'
 import { rrfFuse } from './rrf'
-import { Store, type MemRecord } from './store'
-import { VectorIndex } from './vectors'
+import { Store, recordRevision, type MemRecord } from './store'
+import { VectorIndex, type VectorSnapshot } from './vectors'
 import type { Embedder } from './embedding/provider'
 
 export type RecallBackend = 'bm25' | 'rrf' | 'semantic'
@@ -40,16 +40,34 @@ export async function searchOnce(
     return { backend: 'bm25', hits: bm.slice(0, opts.limit) }
   }
   if (embedder !== undefined && (embedder.dim ?? 1) !== 0 && vectors !== undefined) {
+    let vecSnapshot: VectorSnapshot | undefined
     try {
-      const qv = await embedder.embed(query)
-      if (qv.length > 0) {
-        const sem = semantic(records, qv, pool, opts.project, (id) => vectors.get(id))
-        if (sem.length > 0) {
-          return { backend: 'rrf', hits: rrfFuse([sem, bm], opts.limit) }
-        }
-      }
+      vecSnapshot = vectors.snapshot('vector.search')
     } catch (e) {
-      logger?.warn(`嵌入失败，回退 BM25: ${e instanceof Error ? e.message : String(e)}`)
+      logger?.warn(`向量不可用，回退 BM25: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    if (vecSnapshot !== undefined) {
+      try {
+        const qv = await embedder.embed(query)
+        if (qv.length > 0) {
+          const revById = new Map(records.map((r) => [r.id, recordRevision(r)]))
+          const getVector = (id: string): number[] | undefined => {
+            const recorded = vecSnapshot!.revisionOf(id)
+            // 新格式带 revision：与当前记忆版本不一致的向量不参与语义匹配（由 reembed 补齐）。
+            if (recorded !== undefined) {
+              const current = revById.get(id)
+              if (current === undefined || current !== recorded) return undefined
+            }
+            return vecSnapshot!.get(id)
+          }
+          const sem = semantic(records, qv, pool, opts.project, getVector)
+          if (sem.length > 0) {
+            return { backend: 'rrf', hits: rrfFuse([sem, bm], opts.limit) }
+          }
+        }
+      } catch (e) {
+        logger?.warn(`嵌入失败，回退 BM25: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }
   }
   return { backend: 'bm25', hits: bm.slice(0, opts.limit) }
@@ -67,6 +85,13 @@ export async function recallSearch(
   opts: RecallSearchOpts,
 ): Promise<SearchOnceResult> {
   const s = new Store(dir)
-  const vectors = opts.embedder !== undefined ? new VectorIndex(dir) : undefined
+  let vectors: VectorIndex | undefined
+  if (opts.embedder !== undefined && !opts.bm25Only) {
+    try {
+      vectors = new VectorIndex(dir)
+    } catch (e) {
+      opts.logger?.warn(`向量侧车不可用，回退 BM25: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
   return searchOnce(s.all(), vectors, opts.embedder, query, opts, opts.logger)
 }

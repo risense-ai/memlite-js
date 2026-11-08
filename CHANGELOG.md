@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0 (2026-11-08)
+
+### 并发：多读单写与本地多进程
+
+- 新增协作式跨进程文件锁：数据共享读/排他写、向量写锁、检索日志写锁；锁文件 `.memlite-data.lock` / `.memlite-vector.lock` / `.memlite-log.lock`
+- 原生锁通过可选依赖 `fs-ext` 提供（Unix `flock`）；未安装时 `single-writer` 降级为进程内锁并在 `status()` 明示，`multi-process` 报 `LOCK_UNSUPPORTED`
+- `Store` 全部写入口统一为“锁内重载 → 校验父/版本/防环/显式 id → 追加 → fsync → 轮转”；新增、更新、删除、改挂、`putFull` 不再绕过锁
+- 读取新增 `Store.snapshot()` / `Memlite.snapshot()`：同一代次的不可变视图；recall/show/list/tree/chain/status 使用同一快照，因果视界不跨代拼装
+- 压实使用随机临时文件名、先原子替换活跃文件再删归档；轮转在数据排他锁内；启动清理一小时前的本协议残留临时文件
+- `sync` 在数据共享锁内冻结 git index；代次变化时重取或报 `SNAPSHOT_CHANGED`，不把未审核并发新增混入提交
+- 新增 `concurrency.mode` / `concurrency.filesystem` / `concurrency.lock_timeout_ms` 配置；`configSet` 校验枚举与超时范围
+- 新增 `meta.json` 的 `storage_protocol=1` 首次写入标记
+- 新增 NFS 显式 opt-in 与隔离探针（锁、写后读、rename、fsync）；**真实 NFS 双客户端尚未验收，发布说明不宣称支持任意 NAS**
+- 新增错误类型：`LockTimeoutError`（`LOCK_TIMEOUT`）、`LockUnsupportedError`（`LOCK_UNSUPPORTED`）、`SnapshotChangedError`（`SNAPSHOT_CHANGED`）、`VectorCorruptError`（`VECTOR_CORRUPT`）；扩展 `UNSUPPORTED_FILESYSTEM`、`NFS_PROBE_FAILED`
+- 新增 15 例真实多进程测试：8 进程并发新增、同显式 id、同 revision 条件写、压实/轮转、快照读取、日志追加、向量并发、杀进程释放锁、超时与降级
+
+### 向量
+
+- `VectorIndex` 写入持向量排他锁，锁内重载 `emb.f32` / `emb-ids.txt` / 维度后再写
+- 新增 `emb-meta.json` 记录向量对应的记忆 revision；嵌入返回后若记录已更新/删除，不覆盖向量，由 `reembed` 补齐
+- 新增 `VectorIndex.snapshot()`，读取在共享锁内加载同一代次，释放后用不可变缓存计算
+- `f32` 尾部崩溃残留可识别并在下一次写入时截断；id 数/维度/字节数不一致报 `VECTOR_CORRUPT` 并停止语义索引
+- `reembed` 按 `batchSize` 分批，逐批受锁提交
+
+### 兼容
+
+- `status().vectors` 仍为数量；新增 `status().vector_status` 与 `status().concurrency`
+- JSONL、BM25/RRF 常量、因果树字段不变；新增锁文件与 `emb-meta.json` 不影响 Rust 读取旧契约
+- Rust 端锁协议尚未同步；同库运行期间不要让未升级的 Rust/旧版 JS 同时写
+
 ## 0.2.0 (2026-11-08)
 
 ### 条件写与版本守卫

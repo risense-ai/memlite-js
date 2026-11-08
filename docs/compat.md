@@ -12,11 +12,17 @@ data_dir/
 ├── memory-0001.jsonl         # 归档（16MB 轮转）
 ├── memory-0002.jsonl
 ├── memory.querylog.jsonl     # 检索日志
-├── meta.json                 # 预留
+├── meta.json                 # 元数据；0.3.0 起写 storage_protocol=1
 ├── emb.f32                   # 向量 packed f32 LE（仅在启用嵌入时存在）
 ├── emb-ids.txt               # 向量 id 顺序对齐
+├── emb-meta.json             # JS 0.3.0 新增：向量 revision manifest（不参与同步）
+├── .memlite-data.lock        # 数据读写锁（0.3.0 新增，不参与同步）
+├── .memlite-vector.lock      # 向量写锁（不参与同步）
+├── .memlite-log.lock         # 检索日志写锁（不参与同步）
 └── .gitignore
 ```
+
+锁文件与 `emb-meta.json` 只属于本机运行时元数据，不进 git 白名单。
 
 ---
 
@@ -25,7 +31,7 @@ data_dir/
 ### 2.1 put 行
 
 ```json
-{"op":"put","id":"abc123def456","ts":1792078629.79,"title":"...","content":"...","tags":[],"project":"","parent_id":"","importance":"important","kind":"Context"}
+{"op":"put","id":"abc123def456","ts":1792078629.79,"title":"...","content":"...","tags":[],"project":"","parent_id":"","importance":"important","kind":"Context","revision":3}
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
@@ -40,6 +46,7 @@ data_dir/
 | `parent_id` | string | | 因父 id；空串=根 |
 | `importance` | string | | `"important"` / `"trivial"`；缺省视 important |
 | `kind` | string | | `Context` / `Task` / `Skill` / ... |
+| `revision` | number | | JS 0.2.0 起：条件写版本号；新条 0，更新/改挂递增。旧数据缺失时以 `ts` 毫秒化作为初值 |
 | 其他 | 任意 | | serde flatten 进 extra；JS 用 `Record<string, unknown>` 平铺接收 |
 
 ### 2.2 del 行
@@ -86,9 +93,26 @@ xyz789qwe012
 
 读时 `dim = file_bytes / 4 / ids.len()`。首写定维，后续写入维度必须一致否则拒收。
 
-### 3.4 同步
+### 3.4 revision manifest（JS 0.3.0 新增）
 
-向量文件**不在** sync 白名单里——本机可重算（`reembed`），不入 git。
+`emb-meta.json`：
+
+```json
+{
+  "version": 1,
+  "dim": 1024,
+  "revisions": { "abc123def456": 3 }
+}
+```
+
+- 记录每条向量对应的记忆 `revision`；写入向量时在向量锁内校验，记忆已更新/删除则跳过，由 `reembed` 补齐。
+- 旧库没有该文件时按“未知 revision”处理，向量仍可用于语义检索（兼容旧行为）；新写入会补 manifest。
+- Rust 端可忽略此文件；它不改变 `emb.f32` / `emb-ids.txt` 的旧契约。
+- `emb.f32` 末尾出现无 id 对应的多余槽位视为崩溃残留：读取忽略，下一次写入在锁内截断；id 数/维度/字节数不一致时报 `VECTOR_CORRUPT` 并停止语义索引。
+
+### 3.5 同步
+
+向量文件与 `emb-meta.json` **不在** sync 白名单里——本机可重算（`reembed`），不入 git。
 
 ---
 
@@ -111,7 +135,25 @@ xyz789qwe012
 
 字段同用户级，覆盖合并。
 
-### 4.3 env 覆盖
+### 4.3 并发配置（JS 0.3.0 新增）
+
+```json
+{
+  "concurrency": {
+    "mode": "single-writer",
+    "filesystem": "local",
+    "lock_timeout_ms": 10000
+  }
+}
+```
+
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `mode` | `single-writer`（默认）/ `multi-process` | 允许多个遵守协议的进程读写同一目录 |
+| `filesystem` | `local`（默认）/ `auto` / `nfs` | `nfs` 显式 opt-in 并跑隔离探针；检测到网络盘但未 opt-in 时拒绝共享写入 |
+| `lock_timeout_ms` | 100..120000，默认 10000 | 有界等待，超时报 `LOCK_TIMEOUT` |
+
+### 4.4 env 覆盖
 
 ```
 MEMLITE_DATA         → data_dir
@@ -123,7 +165,7 @@ MEMLITE_MODEL_DIR    → bge-m3 模型目录
 MEMLITE_EMBED_THREADS → 嵌入推理线程数
 ```
 
-### 4.4 优先级
+### 4.5 优先级
 
 ```
 env > 项目级 > 用户级 > 默认
@@ -133,7 +175,19 @@ env > 项目级 > 用户级 > 默认
 
 ---
 
-## 五、检索算法常量
+## 五、并发与锁协议（0.3.0）
+
+- 所有遵循协议的写者必须持有 `.memlite-data.lock` 排他锁；读取快照持共享锁。
+- 写入顺序固定：数据锁 → 向量锁；嵌入网络请求期间不持数据锁。
+- 所有写操作在锁内重新加载最新 JSONL，再校验父节点、revision、防环与显式 id 唯一性。
+- 未传 `expectedRevision` 的更新保留 LWW，但“最后”以实际取得提交锁的顺序为准；宿主 UI 必须传 revision。
+- 旧版/外部脚本不遵守 advisory lock，无法被绝对阻止；同库运行期间禁止未升级写者。
+- `meta.json` 的 `storage_protocol=1` 是参与锁协议的标记；旧库没有该字段。
+- NFS 支持尚未验收：代码提供显式 opt-in 与探针，但发布说明不得宣称已支持任意 NFS 配置。
+
+---
+
+## 六、检索算法常量
 
 任何版本改动下列常量即破坏互通（同查询两版结果会不一致）：
 
@@ -149,7 +203,7 @@ env > 项目级 > 用户级 > 默认
 
 ---
 
-## 六、`memory.querylog.jsonl` 行格式
+## 七、`memory.querylog.jsonl` 行格式
 
 ```json
 {"ts":1792078629.79,"query":"...","backend":"semantic|bm25|rrf","limit":10,"fallback":"user|","source":"cli|web|dsh","ms":17,"hits":[{"id":"...","score":0.657,"title":"..."}]}
@@ -164,7 +218,7 @@ env > 项目级 > 用户级 > 默认
 
 ---
 
-## 七、敏感闸规则
+## 八、敏感闸规则
 
 两版必须对同一段文本给出相同的拒入判定。当前规则集：
 
@@ -180,7 +234,7 @@ env > 项目级 > 用户级 > 默认
 
 ---
 
-## 八、互通测试
+## 九、互通测试
 
 `packages/core/tests/compat/`：
 

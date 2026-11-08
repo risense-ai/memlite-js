@@ -176,6 +176,19 @@
 
 ---
 
+## 并发（0.3.0，2026-11-08）
+
+- [x] M0 JS spike：`fs-ext` 编译与 flock 同进程/跨进程/退出释放/超时实测
+- [x] M1 级别 0：数据共享读锁、排他写锁、快照代次、统一提交、压实/轮转、sync 锁内冻结 index
+- [x] M2 级别 1：multi-process 写者队列、条件写锁内重读、向量锁与 revision manifest、日志锁
+- [x] M3 JS 宿主接入：`Memlite.snapshot()`、异步嵌入写前复核、`reembed` 分批、状态输出
+- [ ] M4 级别 2：NFS 显式配置与探针已实现；真实 NFS 双客户端验收未做
+- [x] 测试：15 例真实多进程并发测试；全套 121 例（117 通过 + 4 例 Rust 互通按条件跳过）
+- [ ] Rust 端锁协议与跨语言互通（`respire-memlite`）
+- [ ] Windows 原生锁与打包验收
+
+详见 [concurrency-progress.md](./concurrency-progress.md)。
+
 ## M7 DSH 插件（独立仓库，下一阶段）
 
 不在本仓范围。M6 完成后启动 `risense/dsh-memlite`，依赖 `@rsrsai/memlite`。

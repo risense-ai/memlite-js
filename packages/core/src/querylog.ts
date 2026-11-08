@@ -7,6 +7,7 @@
  */
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { LockManager, type ConcurrencyConfig } from './lock'
 
 export const LOG_FILE = 'memory.querylog.jsonl'
 /** 载入内存保留的最近条数（recent/stats 展示窗口；counts 按全量行聚合） */
@@ -87,18 +88,60 @@ function logPath(dataDir: string): string {
   return path.join(dataDir, LOG_FILE)
 }
 
+function logSignature(dataDir: string): string {
+  try {
+    const stat = fs.statSync(logPath(dataDir), { bigint: true })
+    return `${stat.size}:${stat.mtimeNs}:${stat.ino}`
+  } catch {
+    return 'missing'
+  }
+}
+
+export interface LogOptions {
+  concurrency?: ConcurrencyConfig
+  logger?: { warn(msg: string): void }
+  nativeLock?: boolean
+}
+
 /** 日志在进程内的常驻形态：尾窗条目 + 全量命中次数 */
 export class Log {
   private entries: Entry[] = []
   private counts = new Map<string, number>()
   private total = 0
   private badLines = 0
+  private readonly dataDir: string
+  private readonly lock: LockManager
+  private loadedSignature = ''
 
-  /** 载入：全文件扫一遍聚 counts（total/bad_lines 全量），entries 只留末 KEEP 条 */
-  constructor(dataDir: string) {
+  /** 载入：共享日志锁内全文件扫一遍聚 counts（total/bad_lines 全量），entries 只留末 KEEP 条 */
+  constructor(dataDir: string, options: LogOptions = {}) {
+    this.dataDir = dataDir
+    this.lock = new LockManager({
+      dataDir,
+      concurrency: options.concurrency,
+      logger: options.logger,
+      native: options.nativeLock,
+    })
+    this.lock.withLock(
+      'log',
+      'shared',
+      'querylog.open',
+      () => {
+        this.loadLocked()
+        this.loadedSignature = logSignature(dataDir)
+      },
+      { createDir: false },
+    )
+  }
+
+  private loadLocked(): void {
+    this.entries = []
+    this.counts = new Map()
+    this.total = 0
+    this.badLines = 0
     let text: string
     try {
-      text = fs.readFileSync(logPath(dataDir), 'utf8')
+      text = fs.readFileSync(logPath(this.dataDir), 'utf8')
     } catch {
       return
     }
@@ -116,32 +159,62 @@ export class Log {
     }
   }
 
-  /** 落盘一行并就地更新内存视图（memory 持有时） */
+  private withRead<T>(operation: string, fn: () => T): T {
+    return this.lock.withLock(
+      'log',
+      'shared',
+      operation,
+      () => {
+        const sig = logSignature(this.dataDir)
+        if (sig !== this.loadedSignature) {
+          this.loadLocked()
+          this.loadedSignature = sig
+        }
+        return fn()
+      },
+      { createDir: false },
+    )
+  }
+
+  /** 落盘一行并就地更新内存视图（memory 持有时）；追加在日志排他锁内完成。 */
   append(dataDir: string, e: Entry): void {
-    appendLine(dataDir, e)
-    for (const h of e.hits) this.counts.set(h.id, (this.counts.get(h.id) ?? 0) + 1)
-    this.total++
-    this.entries.push(e)
-    if (this.entries.length > KEEP) {
-      this.entries.splice(0, this.entries.length - KEEP)
-    }
+    this.lock.withLock(
+      'log',
+      'exclusive',
+      'querylog.append',
+      () => {
+        appendLineLocked(dataDir, e)
+        this.loadedSignature = logSignature(dataDir)
+        for (const h of e.hits) this.counts.set(h.id, (this.counts.get(h.id) ?? 0) + 1)
+        this.total++
+        this.entries.push(e)
+        if (this.entries.length > KEEP) {
+          this.entries.splice(0, this.entries.length - KEEP)
+        }
+      },
+      { createDir: true },
+    )
   }
 
   countOf(id: string): number {
-    return this.counts.get(id) ?? 0
+    return this.withRead('querylog.count', () => this.counts.get(id) ?? 0)
   }
 
   totalCount(): number {
-    return this.total
+    return this.withRead('querylog.total', () => this.total)
   }
 
   /** 最近 n 条（新→旧） */
   recent(n: number): Entry[] {
-    return this.entries.slice(-n).reverse()
+    return this.withRead('querylog.recent', () => this.entries.slice(-n).reverse())
   }
 
   /** 汇总：次数、档位/来源分布、平均与零命中、命中最多的条目 top */
   stats(top: number): Record<string, unknown> {
+    return this.withRead('querylog.stats', () => this.statsLocked(top))
+  }
+
+  private statsLocked(top: number): Record<string, unknown> {
     let since = Number.MAX_VALUE
     let until = 0
     let sem = 0
@@ -206,21 +279,61 @@ export class Log {
   }
 }
 
-/** 只落盘、不载内存（CLI 短进程用） */
-export function appendLine(dataDir: string, e: Entry): void {
+/** 只落盘、不载内存（CLI 短进程用）；日志排他锁内追加一行。 */
+export function appendLine(dataDir: string, e: Entry, options: LogOptions = {}): void {
+  const lock = new LockManager({
+    dataDir,
+    concurrency: options.concurrency,
+    logger: options.logger,
+    native: options.nativeLock,
+  })
+  lock.withLock(
+    'log',
+    'exclusive',
+    'querylog.append',
+    () => appendLineLocked(dataDir, e),
+    { createDir: true },
+  )
+}
+
+function appendLineLocked(dataDir: string, e: Entry): void {
   fs.mkdirSync(dataDir, { recursive: true })
-  fs.appendFileSync(logPath(dataDir), entryJson(e) + '\n')
+  const fd = fs.openSync(logPath(dataDir), 'a')
+  try {
+    fs.writeSync(fd, entryJson(e) + '\n')
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
 }
 
 /** 导出训练集：每行一次查询 {ts, query, backend, fallback, limit, positive(ids 按名次), hits}
  * since 为 unix 秒下限（0＝全部）；返回导出条数 */
-export function exportLog(dataDir: string, out: string, since: number): number {
-  let text: string
-  try {
-    text = fs.readFileSync(logPath(dataDir), 'utf8')
-  } catch (e) {
-    throw new Error(`读日志失败: ${String(e)}`)
-  }
+export function exportLog(
+  dataDir: string,
+  out: string,
+  since: number,
+  options: LogOptions = {},
+): number {
+  const lock = new LockManager({
+    dataDir,
+    concurrency: options.concurrency,
+    logger: options.logger,
+    native: options.nativeLock,
+  })
+  const text = lock.withLock(
+    'log',
+    'shared',
+    'querylog.export',
+    () => {
+      try {
+        return fs.readFileSync(logPath(dataDir), 'utf8')
+      } catch (e) {
+        throw new Error(`读日志失败: ${String(e)}`)
+      }
+    },
+    { createDir: false },
+  )
   let n = 0
   const buf: string[] = []
   for (const line of text.split('\n').filter((l) => l.trim() !== '')) {
