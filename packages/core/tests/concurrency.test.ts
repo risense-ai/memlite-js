@@ -324,7 +324,7 @@ describe('并发配置与文件系统探测', () => {
     expect(() => configSet('concurrency.lock_timeout_ms', '10', false, ctx)).toThrow('100')
   })
 
-  it('首次写入标记 storage_protocol=1，旧库保持可读', () => {
+  it.skipIf(!native)('首次写入标记 storage_protocol=1，旧库保持可读', () => {
     const d = tmp()
     const s = new Store(d, undefined, { concurrency: { mode: 'multi-process' } })
     expect(s.concurrencyStatus().storage_protocol).toBe(0)
@@ -350,15 +350,27 @@ describe('并发配置与文件系统探测', () => {
     expect(() => new VectorIndex(bad)).toThrow(VectorCorruptError)
   })
 
-  it('本地目录识别为 local；隔离探针通过', () => {
+  it('本地目录识别为 local', () => {
     const d = tmp()
     const info = detectFilesystem(d)
     expect(['local', 'unknown']).toContain(info.kind)
+  })
+
+  it.skipIf(!native)('本地目录的隔离探针通过', () => {
+    const d = tmp()
     resetNfsProbeCache()
     const probe = probeNfs(d)
     expect(probe.ok).toBe(true)
     expect(probe.checks.every((c) => c.ok)).toBe(true)
     // 探针不留下真实记忆文件
     expect(fs.existsSync(path.join(d, 'memory.jsonl'))).toBe(false)
+  })
+
+  it.skipIf(native)('无原生锁时隔离探针回报不可用', () => {
+    const d = tmp()
+    resetNfsProbeCache()
+    const probe = probeNfs(d)
+    expect(probe.ok).toBe(false)
+    expect(probe.checks.some((c) => c.name === 'native-lock' && !c.ok)).toBe(true)
   })
 })

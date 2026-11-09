@@ -39,6 +39,10 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Install optional native lock (fs-ext, for concurrency tests)
+        # fs-ext 是可选 peerDependency，不进仓库清单；CI 显式安装以保留真实多进程测试。
+        run: pnpm add -w -D fs-ext@^2.1.1
+
       - name: Typecheck
         run: pnpm -r typecheck
 

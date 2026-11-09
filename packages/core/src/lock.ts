@@ -79,7 +79,7 @@ export class LockUnsupportedError extends ConcurrencyError {
     super('LOCK_UNSUPPORTED', `文件锁不可用: ${reason}`, {
       dataDir,
       operation,
-      advice: '安装可选依赖 fs-ext（需本机编译工具），或退回 single-writer 并确保只有一个写者',
+      advice: '安装可选 peer 依赖 fs-ext（pnpm add fs-ext；需本机编译工具）后重新加载，或退回 single-writer 并确保只有一个写者',
     })
     this.name = 'LockUnsupportedError'
   }
@@ -277,7 +277,7 @@ export class LockManager {
   warnIfDegraded(): void {
     if (this.backend === 'in-process') {
       this.logger.warn(
-        '原生文件锁 fs-ext 不可用：single-writer 降级为进程内锁；多进程或 NFS 模式会被拒绝',
+        '原生文件锁 fs-ext 未安装（可选 peer）：single-writer 使用进程内锁；多进程或 NFS 模式会被拒绝；需要时 pnpm add fs-ext',
       )
     }
   }

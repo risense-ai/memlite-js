@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 (2026-11-09)
+
+安装体验：原生锁 `fs-ext` 改为可选 peer 依赖。
+
+- 发布包不再自动安装 `fs-ext`。此前它作为 `optionalDependencies` 会让 pnpm 触发依赖构建审批；
+  非交互安装（如 DSH 插件管理器）会因 `ERR_PNPM_IGNORED_BUILDS` 判定失败并回滚，
+  导致依赖本包的插件在编译不了原生模块的机器上装不上。
+- 需要 `multi-process` 的调用方显式安装：`pnpm add fs-ext@^2.1.1`；未安装时 `single-writer`
+  仍降级为进程内锁，`status().concurrency.lock_backend` 显示 `in-process`，`multi-process` 报 `LOCK_UNSUPPORTED`。
+- CI 测试任务在安装后显式安装 `fs-ext` 以保留原生多进程测试；本地需要时手动 `pnpm add -w -D fs-ext@^2.1.1`。
+  它不进发布清单，因此没有编译工具链的机器安装本包不会被原生构建卡住。
+- 仓库根 `.npmrc` 设 `auto-install-peers=false`；缺原生锁时相关测试自动 skip，并新增一条「无原生锁时隔离探针回报不可用」用例。
+- 无运行时行为、锁协议或数据格式变化。
+
 ## 0.3.0 (2026-11-08)
 
 ### 并发：多读单写与本地多进程

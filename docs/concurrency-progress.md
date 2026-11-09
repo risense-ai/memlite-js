@@ -21,7 +21,7 @@
 | 嵌入计算移出数据锁、写前 revision 复核 | ✅ | `Memlite.embedRecord()` / `writeVectorIfCurrent()` |
 | `reembed` 分批、逐批受锁提交 | ✅ | `Memlite.reembed()` |
 | sync 锁内冻结 index、代次变化中止 | ✅ | `src/sync.ts` |
-| 原生锁可选依赖 `fs-ext` | ✅（optionalDependencies） | `package.json` |
+| 原生锁可选依赖 `fs-ext` | ✅（optional peerDependency；CI 测试任务显式安装，本地按需安装） | `package.json`、`.github/workflows/ci.yml` |
 | 锁错误码 `LOCK_TIMEOUT` / `LOCK_UNSUPPORTED` / `SNAPSHOT_CHANGED` / `VECTOR_CORRUPT` | ✅ | `src/lock.ts`、`src/vectors.ts` |
 | NFS 显式 opt-in、隔离探针 | ✅ 代码就绪；**未在真实 NFS 验收** | `probeNfs()` |
 | 多真实进程测试 | ✅ 15 例 | `tests/concurrency.test.ts` |
@@ -29,6 +29,9 @@
 ## 实测证据
 
 - `fs-ext@2.1.1` 在 Node 24.18.0 / macOS arm64 本机编译通过。
+- 0.3.1 起 `fs-ext` 是可选 peer：发布包安装时不自动下载/构建；无编译工具链的机器上 pnpm 直接跳过，
+  不再出现「未批准构建脚本」导致的安装失败与回滚；运行期 `loadFsExt()` 返回 `null` 并降级。
+- CI 的测试任务在 `pnpm install` 之后显式安装 `fs-ext`（不进仓库清单），原生进程测试照常运行。
 - `flock` 实测：同进程不同 fd 互斥、跨进程互斥、进程被 `SIGKILL` 后自动释放、非阻塞失败返回 `EAGAIN`。
 - 8 个真实 Node 进程各写 10 条：80 条全部保留、无坏行、id 无重复。
 - 同显式 id 并发新增：仅一个成功，另一个报 id 已存在。

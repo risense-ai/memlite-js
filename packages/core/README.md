@@ -6,7 +6,7 @@
 
 把 memlite 的核心记忆机制抽成 npm 包，供宿主插件（DSH / Kimi / ZCode / Codex 等）直接 `import`——**无子进程开销、库常驻内存、召回 1ms 级**。
 
-- **可嵌入**：Node ≥ 18，主路径零外部依赖；多进程模式可选原生锁 `fs-ext`（可选依赖，缺省不影响单写者）
+- **可嵌入**：Node ≥ 18，主路径零外部依赖；多进程模式可选原生锁 `fs-ext`（可选 peer 依赖，未安装不影响单写者）
 - **可互通**：与 Rust memlite 读写同一份 `memory.jsonl` / `emb.f32` / `config.json`（契约见 [compat](../../docs/compat.md)）
 - **可渐进**：默认纯 BM25 零外网；嵌入档显式开启
 - **可并发**：级别 0 多读单写、级别 1 本地多进程读写；NFS 探针就绪但未验收
@@ -110,7 +110,7 @@ const mem = new Memlite({
 | 向量 | 向量排他锁 + `emb-meta.json` revision 校验；过期向量不写，由 `reembed` 补齐 |
 | 日志 | `memory.querylog.jsonl` 追加持独立写锁，失败不回滚已提交记忆 |
 
-- 原生锁来自可选依赖 `fs-ext`（Unix `flock`；Windows 语义待验收）。安装失败时 `single-writer` 降级为进程内锁，`status().concurrency.lock_backend` 会显示 `in-process`；`multi-process` 直接报 `LOCK_UNSUPPORTED`。
+- 原生锁来自可选 peer 依赖 `fs-ext`（Unix `flock`；Windows 语义待验收；需 `pnpm add fs-ext` 显式安装）。未安装时 `single-writer` 降级为进程内锁，`status().concurrency.lock_backend` 会显示 `in-process`；`multi-process` 直接报 `LOCK_UNSUPPORTED`。
 - 锁文件：`.memlite-data.lock` / `.memlite-vector.lock` / `.memlite-log.lock`；不参与 git 同步。
 - 网络文件系统：检测到 NFS/SMB 等且未配置 `filesystem: 'nfs'` 时拒绝共享写入；`nfs` 模式先跑隔离探针。**NFS 尚未完成真实双客户端验收，发布说明不宣称支持任意 NAS。**
 - 与 Rust 版同库混写：Rust 端尚未同步锁协议；升级前不要让两端同时写。跨设备仍用 `memlite sync`。
@@ -140,6 +140,16 @@ pnpm -C packages/core test        # vitest
 pnpm -C packages/core typecheck   # tsc --noEmit
 pnpm -C packages/core build       # tsup → dist（ESM+CJS+d.ts）
 ```
+
+原生多进程测试需要可选 peer `fs-ext`（有编译工具链时）：
+
+```bash
+pnpm add -w -D fs-ext@^2.1.1      # 仅本地开发，勿提交；CI 测试任务会自行安装
+pnpm -C packages/core test
+```
+
+仓库根 `.npmrc` 设了 `auto-install-peers=false`，避免开发安装时自动拉取可选 peer；没有原生锁时，
+依赖它的测试（真实多进程、隔离探针）会自动 skip，其余测试照常通过。
 
 ## 协议
 

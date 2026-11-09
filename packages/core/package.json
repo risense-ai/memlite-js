@@ -1,6 +1,6 @@
 {
   "name": "@rsrsai/memlite",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Embeddable local memory engine (TypeScript). Data-compatible with respire-memlite (Rust).",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -50,8 +50,13 @@
     "url": "https://github.com/risense-ai/memlite-js/issues"
   },
   "homepage": "https://github.com/risense-ai/memlite-js#readme",
-  "optionalDependencies": {
+  "peerDependencies": {
     "fs-ext": "^2.1.1"
+  },
+  "peerDependenciesMeta": {
+    "fs-ext": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
